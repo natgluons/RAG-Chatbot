@@ -1,5 +1,5 @@
 
-# OpenAI Chatbot with RAG (Retrieval-Augmented Generation): Retrieve Information from CVOpenAI Chatbot with RAG (Retrieval-Augmented Generation): Retrieve Information from CV
+# OpenAI Chatbot with RAG (Retrieval-Augmented Generation): Retrieve Information from CV
 
 ## Overview
 This project is an OpenAI-powered chatbot that uses Retrieval-Augmented Generation (RAG) to enhance responses with relevant information from provided documents. The chatbot is deployed using Docker and Kubernetes, and it's designed to be accessed via a web interface.
