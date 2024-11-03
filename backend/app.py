@@ -1,89 +1,133 @@
 from flask import Flask, request, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
-from models import get_db_connection, init_db           # do not change this!! use models, not backend.models
-# import openai
+from logging.config import dictConfig
+from models import get_db_connection, init_db
 from openai import OpenAI
-import datetime
 import os
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from PyPDF2 import PdfReader
-# from PyPDF2 import PdfFileReader
-# from PyPDF2 import extract_text
 import pandas as pd
 from dotenv import load_dotenv
+import time
+
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.chains.conversation.memory import ConversationBufferMemory
+from PyPDF2 import PdfReader
+
+dictConfig({
+    'version': 1,
+    'formatters': {'default': {
+        'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+    }},
+    'handlers': {'wsgi': {
+        'class': 'logging.StreamHandler',
+        'stream': 'ext://flask.logging.wsgi_errors_stream',
+        'formatter': 'default'
+    }},
+    'root': {
+        'level': 'INFO',
+        'handlers': ['wsgi']
+    }
+})
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['UPLOAD_FOLDER'] = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'txt', 'csv'}
 
-# Load environment variables from .env file
 load_dotenv()
-client = OpenAI()
-# client = openai()
 
-# Access the OpenAI API key
-# OpenAI.api_key = os.getenv('OPENAI_API_KEY')
-# openai.api_key = os.getenv('OPENAI_API_KEY')
+openai_api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=openai_api_key)
 
-# Initialize the database
 init_db()
 
-# Function to load documents from a folder
+def chunk_text(text, max_length=50):
+    words = text.split()
+    return [' '.join(words[i:i + max_length]) for i in range(0, len(words), max_length)]
+
 def load_documents(folder_path):
     documents = []
     for filename in os.listdir(folder_path):
         file_path = os.path.join(folder_path, filename)
         if filename.endswith(".txt"):
             with open(file_path, 'r', encoding='utf-8') as file:
-                documents.append(file.read())
+                text_chunks = chunk_text(file.read())
+                for chunk in text_chunks:
+                    documents.append({
+                        "content": chunk,
+                        "metadata": {
+                            "source": filename,
+                            "page": 1
+                        }
+                    })
         elif filename.endswith(".pdf"):
             reader = PdfReader(file_path)
-            # reader = PdfFileReader(file_path)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text()
-            documents.append(text)
+            for page_num, page in enumerate(reader.pages):
+                text = page.extract_text()
+                if text:
+                    text_chunks = chunk_text(text)
+                    for chunk in text_chunks:
+                        documents.append({
+                            "content": chunk,
+                            "metadata": {
+                                "source": filename,
+                                "page": page_num + 1
+                            }
+                        })
         elif filename.endswith(".csv"):
             df = pd.read_csv(file_path)
-            documents.append(df.to_string())
+            text_chunks = chunk_text(df.to_string())
+            for chunk in text_chunks:
+                documents.append({
+                    "content": chunk,
+                    "metadata": {
+                        "source": filename,
+                        "page": 1
+                    }
+                })
     return documents
 
-# # Function to load documents from a folder
-# def load_documents(folder_path):
-#     documents = []
-#     for filename in os.listdir(folder_path):
-#         file_path = os.path.join(folder_path, filename)
-#         if filename.endswith(".txt"):
-#             with open(file_path, 'r', encoding='utf-8') as file:
-#                 documents.append(file.read())
-#         elif filename.endswith(".pdf"):
-#             with open(file_path, 'rb') as file:
-#                 reader = PdfFileReader(file)
-#                 text = ""
-#                 for page_num in range(reader.getNumPages()):
-#                     text += reader.getPage(page_num).extract_text()  # Change this to extract_text()
-#                 documents.append(text)
-#         elif filename.endswith(".csv"):
-#             df = pd.read_csv(file_path)
-#             documents.append(df.to_string())
-#     return documents
-
-# Load documents from the knowledge_sources folder
-folder_path = 'knowledge_sources'  # replace with your folder path
+folder_path = 'knowledge_sources'
 documents = load_documents(folder_path)
+embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+app.logger.info(f"{len(documents)} documents loaded")
+app.logger.info("FAISS indexing...")
+start_time = time.time()
+faiss_index = FAISS.from_texts(
+    [doc['content'] for doc in documents], 
+    embedding=embeddings,
+    metadatas=[doc['metadata'] for doc in documents]
+)
+app.logger.info(f"FAISS indexing done in {time.time() - start_time} seconds")
 
-# Vectorize documents using TF-IDF
-vectorizer = TfidfVectorizer()
-document_vectors = vectorizer.fit_transform(documents)
+retriever = faiss_index.as_retriever(
+    search_type="similarity",
+    search_kwargs={
+        "k": 3,
+        "score_threshold": 0.7
+    }
+)
 
-# Function to search documents
-def search_documents(query, document_vectors, vectorizer):
-    query_vector = vectorizer.transform([query])
-    cosine_similarities = cosine_similarity(query_vector, document_vectors).flatten()
-    related_docs_indices = cosine_similarities.argsort()[::-1]
-    return related_docs_indices, cosine_similarities
+# Initialize conversation memory
+memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    output_key="result"
+)
+
+qa_chain = RetrievalQA.from_llm(
+    llm=ChatOpenAI(
+        model="gpt-4", 
+        api_key=openai_api_key,
+        max_tokens=500,
+        temperature=0.7
+    ),
+    retriever=retriever,
+    memory=memory,
+    return_source_documents=True,
+    verbose=True,
+    output_key="result"
+)
 
 def save_prompt(user_id, role, prompt):
     conn = get_db_connection()
@@ -98,43 +142,55 @@ def get_last_prompts(user_id, limit=10):
     cur.execute("SELECT role, prompt FROM user_prompts WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
     prompts = cur.fetchall()
     conn.close()
-    return [{"role": p['role'], "content": p['prompt']} for p in prompts][::-1]  # Reverse to get the oldest first
+    return [{"role": p[0], "content": p[1]} for p in prompts][::-1]
 
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
     prompt = data['prompt']
-    user_id = 1  # In a real application, you would use the authenticated user's ID
+    user_id = 1
 
-    # Save the current user prompt
     save_prompt(user_id, "user", prompt)
 
-    # Retrieve the last 10 prompts
-    last_prompts = get_last_prompts(user_id)
+    start_retrieval_time = time.time()
+    response = qa_chain.invoke({"query": prompt})
+    retrieval_time = time.time() - start_retrieval_time
 
-    # Search documents
-    related_docs_indices, similarities = search_documents(prompt, document_vectors, vectorizer)
-    document_results = [documents[idx] for idx in related_docs_indices[:3]]  # Top 3 documents
-    document_texts = " ".join(document_results)
-
-    # Prepare the conversation history
-    messages = last_prompts + [{"role": "user", "content": prompt}]
-    context_message = {"role": "system", "content": f"Relevant information: {document_texts}"}
-    messages.insert(0, context_message)  # Insert context at the beginning
-
-    response = client.chat.completions.create(
-    # response = openai.ChatCompletion.create(
-    # response = OpenAI.completions.create(
-        model="gpt-3.5-turbo",
-        messages=messages
-    )
-
-    assistant_message = response.choices[0].message.content.strip()
-
-    # Save the assistant's response
+    assistant_message = response["result"]
     save_prompt(user_id, "assistant", assistant_message)
 
-    return jsonify(response=assistant_message)
+    start_generation_time = time.time()
+    generation_time = time.time() - start_generation_time
+
+    # Extract source documents from response
+    retrieved_docs = response.get("source_documents", [])
+    structured_response = {
+        "retrieval_time": retrieval_time,
+        "generation_time": generation_time,
+        "source_documents": [
+            {
+                "title": doc.metadata.get('source', 'Unknown'),
+                "page_number": doc.metadata.get('page', 'N/A')
+            }
+            for doc in retrieved_docs
+        ]
+    }
+
+    # Filter out duplicate sources
+    seen_sources = set()
+    unique_sources = []
+    for source in structured_response['source_documents']:
+        source_key = f"{source['title']}-{source['page_number']}"
+        if source_key not in seen_sources:
+            seen_sources.add(source_key)
+            unique_sources.append(source)
+    
+    structured_response['source_documents'] = unique_sources
+
+    return jsonify({
+        "response": assistant_message,
+        "sources": structured_response['source_documents']
+    })
 
 @app.route('/')
 def index():
@@ -143,10 +199,6 @@ def index():
 @app.route('/app.js')
 def app_js():
     return send_from_directory('..', 'app.js')
-
-# @app.route('/<path:filename>')
-# def serve_file(filename):
-#     return send_from_directory('..', filename)
 
 if __name__ == '__main__':
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
