@@ -1,0 +1,14 @@
+version: '3'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app # Syncs current directory with /app in the container
+    ports:
+      - "5000:5000" # Expose port 5000
+    environment:
+      FLASK_APP: backend/app.py
+      FLASK_RUN_HOST: 0.0.0.0 # Ensures Flask binds to 0.0.0.0
+    command: flask run --host=0.0.0.0 # Run the Flask app
