@@ -11,7 +11,9 @@ from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
-from langchain.chains.conversation.memory import ConversationBufferMemory
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
 from PyPDF2 import PdfReader
 
 dictConfig({
@@ -112,21 +114,54 @@ retriever = faiss_index.as_retriever(
 memory = ConversationBufferMemory(
     memory_key="chat_history",
     return_messages=True,
-    output_key="result"
+    output_key="result"  # Changed to be consistent
 )
 
-qa_chain = RetrievalQA.from_llm(
+# Define an intent analysis chain to check if retrieval is needed
+intent_analysis_prompt = PromptTemplate.from_template("""
+Based on the following conversation and user query, please answer:
+1. Should additional information from a knowledge base be retrieved? (Yes or No)
+2. If yes, what is the main topic, entity, or name that the query refers to?
+
+Conversation:
+{chat_history}
+
+User Query:
+{user_query}
+
+Answer:
+""")
+
+intent_analysis_chain = LLMChain(
+    llm=ChatOpenAI(model="gpt-4", api_key=openai_api_key, max_tokens=50),
+    prompt=intent_analysis_prompt
+)
+
+# Define the RetrievalQA chain for retrieving and answering based on external documents
+qa_chain = RetrievalQA.from_chain_type(
     llm=ChatOpenAI(
         model="gpt-4", 
         api_key=openai_api_key,
         max_tokens=500,
         temperature=0.7
     ),
+    chain_type="stuff",
     retriever=retriever,
     memory=memory,
     return_source_documents=True,
-    verbose=True,
-    output_key="result"
+    chain_type_kwargs={
+        "verbose": True,
+        "prompt": PromptTemplate(
+            template="""Use the following pieces of context to answer the question at the end. 
+            If you don't know the answer, just say that you don't know.
+
+            {context}
+
+            Question: {question}
+            Answer: """,
+            input_variables=["context", "question"]
+        )
+    }
 )
 
 def save_prompt(user_id, role, prompt):
@@ -136,13 +171,26 @@ def save_prompt(user_id, role, prompt):
     conn.commit()
     conn.close()
 
-def get_last_prompts(user_id, limit=10):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT role, prompt FROM user_prompts WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
-    prompts = cur.fetchall()
-    conn.close()
-    return [{"role": p[0], "content": p[1]} for p in prompts][::-1]
+def parse_analysis_response(response_text):
+    # Split the response by lines and clean each line
+    lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+    
+    # Initialize variables
+    should_retrieve = False
+    retrieval_topic = None
+
+    # Loop through the lines and identify key parts
+    for line in lines:
+        if line.startswith("1."):
+            if "Yes" in line:
+                should_retrieve = True
+            elif "No" in line:
+                should_retrieve = False
+        elif line.startswith("2."):
+            retrieval_topic = line[3:].strip()  # Extract topic after "2."
+
+    return should_retrieve, retrieval_topic
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -152,46 +200,59 @@ def chat():
 
     save_prompt(user_id, "user", prompt)
 
-    start_retrieval_time = time.time()
-    response = qa_chain.invoke({"query": prompt})
-    retrieval_time = time.time() - start_retrieval_time
+    # Load chat history
+    chat_history = memory.load_memory_variables({})["chat_history"]
+    chat_history_text = " ".join([turn.content for turn in chat_history])
 
-    assistant_message = response["result"]
-    save_prompt(user_id, "assistant", assistant_message)
-
-    start_generation_time = time.time()
-    generation_time = time.time() - start_generation_time
-
-    # Extract source documents from response
-    retrieved_docs = response.get("source_documents", [])
-    structured_response = {
-        "retrieval_time": retrieval_time,
-        "generation_time": generation_time,
-        "source_documents": [
-            {
-                "title": doc.metadata.get('source', 'Unknown'),
-                "page_number": doc.metadata.get('page', 'N/A')
-            }
-            for doc in retrieved_docs
-        ]
-    }
-
-    # Filter out duplicate sources
-    seen_sources = set()
-    unique_sources = []
-    for source in structured_response['source_documents']:
-        source_key = f"{source['title']}-{source['page_number']}"
-        if source_key not in seen_sources:
-            seen_sources.add(source_key)
-            unique_sources.append(source)
-    
-    structured_response['source_documents'] = unique_sources
-
-    return jsonify({
-        "response": assistant_message,
-        "sources": structured_response['source_documents']
+    # Run intent analysis to check if retrieval is needed
+    analysis_response = intent_analysis_chain.run({
+        "chat_history": chat_history_text,
+        "user_query": prompt
     })
 
+    app.logger.info(f"Analysis Response: {analysis_response}")
+
+    should_retrieve, retrieval_topic = parse_analysis_response(analysis_response)
+
+    try:
+        if should_retrieve:
+            # Execute retrieval and QA based on user query
+            response = qa_chain({"query": prompt})
+            assistant_message = response["result"]
+            sources = response.get("source_documents", [])
+        else:
+            # For non-retrieval queries, use a simple response from the LLM
+            llm = ChatOpenAI(
+                model="gpt-4", 
+                api_key=openai_api_key,
+                max_tokens=500,
+                temperature=0.7
+            )
+            assistant_message = llm.predict(prompt)
+            sources = []
+
+        save_prompt(user_id, "assistant", assistant_message)
+
+        # Format response with sources if retrieval was performed
+        structured_response = {
+            "source_documents": [
+                {
+                    "title": doc.metadata.get('source', 'Unknown'),
+                    "page_number": doc.metadata.get('page', 'N/A')
+                }
+                for doc in sources
+            ]
+        }
+
+        return jsonify({
+            "response": assistant_message,
+            "sources": structured_response['source_documents']
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error occurred: {e}")
+        return jsonify({"error": "An error occurred while processing your request."}), 500
+    
 @app.route('/')
 def index():
     return send_from_directory('..', 'index.html')
