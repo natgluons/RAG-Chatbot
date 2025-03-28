@@ -29,4 +29,4 @@ Open your browser and navigate to `http://34.71.245.123/` to interact with the c
 
 *this service is currently offline due to cost considerations (Why does Kubernetes cost so much!?)
 
-![ragchatbot](https://github.com/user-attachments/assets/4570bf02-735f-4f92-94f8-b803e6859997)
+![ragchatbot](https://github.com/user-attachments/assets/bfe0bd46-fe7d-42dd-a868-d8f5831fa142)
